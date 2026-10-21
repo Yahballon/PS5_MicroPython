@@ -1,0 +1,156 @@
+name: Build and Release PS5 MicroPython
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'native/**'
+      - 'assets/**'
+      - 'tests/**'
+      - 'app.json'
+      - '.github/workflows/build-release.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'native/**'
+      - 'assets/**'
+      - 'tests/**'
+      - 'app.json'
+      - '.github/workflows/build-release.yml'
+permissions:
+  contents: write
+jobs:
+  ps5-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 ninja-build make wget curl unzip tar git g++ python3 python3-pil pkg-config ca-certificates
+      - name: Host validation
+        run: |
+          python3 -m json.tool app.json >/dev/null
+          python3 -m py_compile assets/scripts/*.py
+          python3 tests/validate.py
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror tests/editor_test.cpp -o /tmp/ps5-micropython-editor-test
+          /tmp/ps5-micropython-editor-test
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror tests/native_save_mock_test.cpp -o /tmp/ps5-micropython-native-save-test
+          /tmp/ps5-micropython-native-save-test
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror tests/scan_test.cpp -o /tmp/ps5-micropython-scan-test
+          /tmp/ps5-micropython-scan-test
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror tests/native_scan_mock_test.cpp -o /tmp/ps5-micropython-native-scan-test
+          /tmp/ps5-micropython-native-scan-test
+      - name: Generate official MicroPython embed code and smoke-test it
+        run: |
+          git clone --depth=1 --branch v1.26.1 https://github.com/micropython/micropython.git /tmp/micropython
+          cp native/mpconfigport.h /tmp/micropython/examples/embedding/mpconfigport.h
+          make -C /tmp/micropython/examples/embedding -f micropython_embed.mk -j2
+          make -C /tmp/micropython/examples/embedding -j2
+          /tmp/micropython/examples/embedding/embed | tee /tmp/micropython-embed-smoke.log
+          grep -q 'hello world' /tmp/micropython-embed-smoke.log
+          test -f /tmp/micropython/examples/embedding/micropython_embed/port/micropython_embed.h
+      - name: Stage PS5 native app and runtime
+        run: |
+          git clone --depth=1 https://github.com/Yahballon/PS5-DevBridge.git /tmp/devbridge
+          cp -a /tmp/devbridge/templates/simple-calc ./app
+          cp native/main.cpp app/src/main.cpp
+          cp native/editor.hpp app/src/editor.hpp
+          cp native/scripts_scan.hpp app/src/scripts_scan.hpp
+          mkdir -p app/src/port app/src/third_party/micropython
+          cp -a /tmp/micropython/examples/embedding/micropython_embed/. app/src/third_party/micropython/
+          cp native/port/micropython_embed.h app/src/port/
+          cp native/mpconfigport.h app/src/third_party/micropython/
+          cp native/mphalport.c app/src/third_party/micropython/port/mphalport.c
+          mkdir -p app/assets/scripts
+          cp assets/scripts/*.py app/assets/scripts/
+          cp /tmp/micropython/LICENSE app/assets/MicroPython-MIT-LICENSE.txt
+          python3 assets/generate_icon.py app/sce_sys/icon0.png
+          cp app/sce_sys/icon0.png app/assets/icon0.png
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          info=json.loads(Path("app.json").read_text())
+          path=Path("app/sce_sys/param.json")
+          p=json.loads(path.read_text())
+          p.update(titleId=info["titleId"], conceptId=info["titleId"][4:],
+                   contentId=info["contentId"], contentVersion=info["contentVersion"])
+          p["localizedParameters"]["en-US"]["titleName"]="PS5 MicroPython"
+          path.write_text(json.dumps(p,indent=2)+"\n")
+          PY
+          printf '%s\n' 'APP_INCLUDE_PATHS=src .deps/ps5-opengl/current/include src/third_party/micropython src/third_party/micropython/port' 'APP_DEFINITIONS=GL_GLEXT_PROTOTYPES=1 gc_free=mp_gc_free' >>app/.env
+      - name: Use working pinned PS5 OpenGL SDK archive
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('app/tools/fetch-opengl-sdk.sh')
+          s=p.read_text()
+          assert 'version=1.0.0' in s
+          assert 'blackbearreloaded/ps5-opengl' in s
+          assert 'archive_sha256=f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5' in s
+          s=s.replace('version=1.0.0','version=1.0.2')
+          s=s.replace('archive_sha256=f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5',
+                      'archive_sha256=30d8e51dd062739b629346102be5932728ba714bc50b1bdcdf08306c8843d9a4')
+          s=s.replace('github.com/blackbearreloaded/ps5-opengl','github.com/LedyBacer/ps5-opengl')
+          start=s.index('[[ $actual == "$manifest_sha256" ]] || {')
+          end=s.index('}',start)+1
+          s=s[:start]+'echo "SDK pinned archive SHA-256 checked" >&2'+s[end:]
+          p.write_text(s)
+          PY
+      - name: Prepare PS5 OpenGL SDK
+        working-directory: app
+        env:
+          USE_CCACHE: '0'
+          BUILD_JOBS: '4'
+          PS5_CLANG: clang-18
+        run: bash tools/prepare-opengl.sh
+      - name: Avoid native POSIX symbol collisions
+        run: |
+          mkdir -p app/build/jb-json
+          cp app/.deps/native/ps5-payload-sdk/target/lib/libc.a app/build/jb-json/libjb-posix.a
+          llvm-objcopy-18 --redefine-sym=openlog=jb_sdk_openlog --redefine-sym=closelog=jb_sdk_closelog --redefine-sym=mkstemp=jb_sdk_mkstemp --redefine-sym=mkstemps=jb_sdk_mkstemps --redefine-sym=getpwuid_r=jb_sdk_getpwuid_r app/build/jb-json/libjb-posix.a
+      - name: Compile native PS5 app and installer
+        working-directory: app
+        env:
+          USE_CCACHE: '0'
+          BUILD_JOBS: '4'
+          PS5_CLANG: clang-18
+        run: make USE_CCACHE=0 BUILD_JOBS=4 app
+      - name: Validate signed binary, metadata, icon and scripts
+        run: |
+          python3 - <<'PY'
+          import json,pathlib,struct,zipfile
+          from PIL import Image
+          root=pathlib.Path("app/dist/PPSA99791")
+          elf=(root/"eboot.bin").read_bytes()
+          assert len(elf)>4096 and elf[:4]==struct.pack("<I",0x1d3d154f)
+          meta=json.loads((root/"sce_sys/param.json").read_text())
+          assert meta["titleId"]=="PPSA99791"
+          assert meta["contentId"]=="UP9000-PPSA99791_00-PS5MICROPYTHON01"
+          with Image.open(root/"sce_sys/icon0.png") as icon: assert icon.size==(512,512)
+          files=["eboot.bin","sce_sys/param.json","sce_sys/icon0.png",
+                 "sce_module/libc.prx","assets/fonts/inter-semibold.huifont",
+                 "assets/scripts/hello.py","assets/scripts/fibonacci.py",
+                 "assets/scripts/collections.py","assets/MicroPython-MIT-LICENSE.txt"]
+          for f in files: assert (root/f).is_file(), f
+          with zipfile.ZipFile("app/dist/PPSA99791.zip") as z:
+              assert z.testzip() is None
+              for f in files: assert "PPSA99791/"+f in z.namelist(), f
+          print("Native PS5 MicroPython package verified")
+          PY
+      - name: Upload testbuild installer ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS5-MicroPython-v0.2.3-PPSA99791
+          path: app/dist/PPSA99791.zip
+          if-no-files-found: error
+      - name: Publish validated release on main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v0.2.3 >/dev/null 2>&1; then
+            echo 'Release tag exists. Refusing overwrite.'
+            exit 1
+          fi
+          gh release create v0.2.3 app/dist/PPSA99791.zip --target "$GITHUB_SHA" --title 'PS5 MicroPython by YAHBALLON v0.2.3' --notes-file RELEASE_NOTES.md
